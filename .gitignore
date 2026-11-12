@@ -1,0 +1,7 @@
+# Avoid committing local credentials or production config files.
+*.conf
+!backup.conf.example
+restic-password
+rclone.conf
+*.log
+.DS_Store

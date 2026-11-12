@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CONFIG_FILE=/etc/restic-rclone-backup.conf
+PASSWORD_FILE=/etc/restic/restic-password
+BIN=/usr/local/sbin/restic-rclone-backup
+UNIT_DIR=/etc/systemd/system
+SOURCE_URL=${RESTIC_RCLONE_SOURCE_URL:-}
+SCRIPT_DIR=
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)
+fi
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+usage() {
+  printf 'Usage: install.sh [--source-url RAW_BASE_URL]\n'
+}
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+while (($#)); do
+  case "$1" in
+    --source-url)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      SOURCE_URL=${2%/}
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$SOURCE_URL" && "$SOURCE_URL" != https://* ]]; then
+  fail 'source URL must use HTTPS'
+fi
+[[ $(id -u) -eq 0 ]] || fail 'run this installer as root, for example with sudo'
+[[ -r /dev/tty && -w /dev/tty ]] || fail 'an interactive terminal is required'
+exec 3<>/dev/tty
+
+prompt_value() {
+  local label=$1
+  local default=${2:-}
+
+  if [[ -n "$default" ]]; then
+    printf '%s [%s]: ' "$label" "$default" >&3
+  else
+    printf '%s: ' "$label" >&3
+  fi
+  IFS= read -r REPLY <&3 || return 1
+  REPLY=${REPLY:-$default}
+}
+
+read_line() {
+  local label=$1
+
+  printf '%s: ' "$label" >&3
+  IFS= read -r REPLY <&3 || return 1
+}
+
+confirm() {
+  local answer
+  prompt_value "$1 (y/N)" n
+  answer=${REPLY,,}
+  [[ "$answer" == y || "$answer" == yes ]]
+}
+
+confirm_default_yes() {
+  local answer
+  prompt_value "$1 (Y/n)" y
+  answer=${REPLY,,}
+  [[ -z "$answer" || "$answer" == y || "$answer" == yes ]]
+}
+
+quote_shell() {
+  printf '%q' "$1"
+}
+
+fetch_file() {
+  local name=$1
+  local local_file=${SCRIPT_DIR:+$SCRIPT_DIR/$name}
+
+  if [[ -f "$local_file" ]]; then
+    cp -- "$local_file" "$TMP_DIR/$name"
+    return
+  fi
+  [[ -n "$SOURCE_URL" ]] || fail "cannot find $name beside install.sh; pass --source-url with the GitHub Raw directory URL"
+  [[ "$SOURCE_URL" == https://* ]] || fail 'source URL must use HTTPS'
+  command -v curl >/dev/null 2>&1 || fail 'curl is required when installing from a URL'
+  curl --fail --location --silent --show-error "$SOURCE_URL/$name" -o "$TMP_DIR/$name"
+}
+
+install_missing_dependencies() {
+  local -a missing=()
+  local command_name
+
+  for command_name in restic rclone flock openssl install systemctl; do
+    command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+  done
+  if [[ -n "$SOURCE_URL" && ! -f "${SCRIPT_DIR:+$SCRIPT_DIR/backup.sh}" ]]; then
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
+  fi
+  if ((${#missing[@]} == 0)); then
+    return 0
+  fi
+
+  printf 'Missing commands: %s\n' "${missing[*]}" >&3
+  confirm_default_yes 'Install missing packages with the detected package manager' || fail 'required commands are missing'
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y restic rclone util-linux openssl curl
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y restic rclone util-linux openssl curl
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y restic rclone util-linux openssl curl
+  elif command -v apk >/dev/null 2>&1; then
+    apk add restic rclone util-linux openssl curl
+  else
+    fail 'no supported package manager found; install restic, rclone, util-linux, openssl, curl, and systemd manually'
+  fi
+
+  for command_name in restic rclone flock openssl install systemctl; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "required command is still missing: $command_name"
+  done
+}
+
+validate_private_file() {
+  local label=$1
+  local path=$2
+  local owner mode
+
+  [[ -f "$path" && ! -L "$path" ]] || fail "$label must be a regular file, not a symlink: $path"
+  owner=$(stat -c '%u' -- "$path") || fail "cannot inspect $label ownership: $path"
+  mode=$(stat -c '%a' -- "$path") || fail "cannot inspect $label permissions: $path"
+  [[ "$owner" == 0 ]] || fail "$label must be owned by root: $path"
+  (( (8#$mode & 0077) == 0 )) || fail "$label must not be group/other accessible: $path"
+}
+
+prepare_rclone_config() {
+  local config_path=$1
+  local parent
+
+  parent=$(dirname -- "$config_path")
+  mkdir -p -- "$parent"
+  [[ ! -L "$config_path" ]] || fail "rclone config must not be a symlink: $config_path"
+  if [[ ! -e "$config_path" ]]; then
+    printf 'No rclone config was found at %s.\n' "$config_path" >&3
+    confirm_default_yes 'Open rclone config now' || fail 'rclone config is required'
+    rclone --config "$config_path" config </dev/tty >/dev/tty
+  fi
+  validate_private_file 'rclone config' "$config_path"
+}
+
+write_config() {
+  local output=$1
+  local path
+
+  {
+    printf '# Generated by install.sh. This file is sourced as Bash; keep it root-owned and mode 0600.\n'
+    printf 'RESTIC_REPOSITORY=%s\n' "$(quote_shell "$repository")"
+    printf 'RESTIC_PASSWORD_FILE=%s\n' "$(quote_shell "$PASSWORD_FILE")"
+    printf 'RCLONE_CONFIG=%s\n' "$(quote_shell "$rclone_config")"
+    printf 'RESTIC_HOST=%s\n' "$(quote_shell "$restic_host")"
+    printf 'RESTIC_CACHE_DIR=%s\n' "$(quote_shell /var/cache/restic-rclone-backup)"
+    printf 'RESTIC_LOCK_FILE=%s\n' "$(quote_shell /run/lock/restic-rclone-backup.lock)"
+    printf 'BACKUP_PATHS=(\n'
+    for path in "${required_paths[@]}"; do
+      printf '  %s\n' "$(quote_shell "$path")"
+    done
+    printf ')\n'
+    printf 'BACKUP_OPTIONAL_PATHS=(\n'
+    for path in "${optional_paths[@]}"; do
+      printf '  %s\n' "$(quote_shell "$path")"
+    done
+    printf ')\n'
+    printf 'RESTIC_EXCLUDE_FILE=%s\n' "$(quote_shell "$exclude_file")"
+    printf 'RESTIC_TAGS=(%s)\n' "$(quote_shell "$restic_tag")"
+    printf 'RESTIC_KEEP_DAILY=%s\n' "$(quote_shell "$keep_daily")"
+    printf 'RESTIC_KEEP_WEEKLY=%s\n' "$(quote_shell "$keep_weekly")"
+    printf 'RESTIC_KEEP_MONTHLY=%s\n' "$(quote_shell "$keep_monthly")"
+    printf 'RESTIC_KEEP_YEARLY=%s\n' "$(quote_shell "$keep_yearly")"
+    printf 'RESTIC_FORGET_AFTER_BACKUP=%s\n' "$forget_after_backup"
+  } >"$output"
+  chmod 0600 "$output"
+}
+
+ask_nonnegative_integer() {
+  local label=$1
+  local default=$2
+
+  while :; do
+    prompt_value "$label" "$default"
+    [[ "$REPLY" =~ ^(0|[1-9][0-9]*)$ ]] && { printf -v "$3" '%s' "$REPLY"; return; }
+    printf 'Enter a non-negative integer.\n' >&3
+  done
+}
+
+ask_backup_path() {
+  local label=$1
+  local required=$2
+  local output_name=$3
+  local path
+
+  printf -v "$output_name" '%s' ''
+  while :; do
+    read_line "$label"
+    path=$REPLY
+    if [[ -z "$path" && "$required" == false ]]; then
+      return
+    fi
+    [[ "$path" == /* ]] || { printf 'Use an absolute path.\n' >&3; continue; }
+    if [[ "$required" == true && ! ( -e "$path" || -L "$path" ) ]]; then
+      printf 'Required path does not exist: %s\n' "$path" >&3
+      continue
+    fi
+    printf -v "$output_name" '%s' "$path"
+    return
+  done
+}
+
+install_missing_dependencies
+
+for name in backup.sh excludes.example restic-rclone-backup.service restic-rclone-backup.timer restic-rclone-prune.service restic-rclone-prune.timer; do
+  fetch_file "$name"
+done
+bash -n "$TMP_DIR/backup.sh"
+
+printf '\nVPS restic+rclone interactive installer\n'
+printf 'The remote repository will be encrypted by restic. Keep the generated password outside this VPS.\n\n'
+
+reuse_config=false
+if [[ -e "$CONFIG_FILE" || -L "$CONFIG_FILE" ]]; then
+  [[ -f "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]] || fail "configuration must be a regular file, not a symlink: $CONFIG_FILE"
+  if confirm 'Keep the existing configuration and only install/update the files'; then
+    reuse_config=true
+  else
+    confirm 'Overwrite the existing configuration after the next prompts' || fail 'installation cancelled'
+  fi
+fi
+
+if [[ "$reuse_config" == false ]]; then
+  rclone_config_default=${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}
+  prompt_value 'Path to the root rclone config' "$rclone_config_default"
+  rclone_config=$REPLY
+  [[ "$rclone_config" == /* ]] || fail 'rclone config path must be absolute'
+  prepare_rclone_config "$rclone_config"
+
+  remote_list=$(rclone listremotes --config "$rclone_config") || fail 'could not list rclone remotes'
+  [[ -n "$remote_list" ]] || fail 'no rclone remotes are configured; run rclone config first'
+  printf '\nAvailable rclone remotes:\n%s\n' "$remote_list" >&3
+  first_remote=
+  while IFS= read -r remote_line; do
+    [[ -n "$remote_line" ]] || continue
+    first_remote=${remote_line%:}
+    break
+  done <<<"$remote_list"
+  prompt_value 'rclone remote name' "$first_remote"
+  remote=${REPLY%:}
+  [[ -n "$remote" && "$remote" != *:* && "$remote" != *[[:space:]]* ]] || fail 'invalid rclone remote name'
+  rclone --config "$rclone_config" lsd "$remote:" >/dev/null || fail "rclone remote is not reachable: $remote"
+
+  host_default=$(hostname -f 2>/dev/null || hostname)
+  prompt_value 'Stable restic host name' "$host_default"
+  restic_host=$REPLY
+  [[ -n "$restic_host" ]] || fail 'host name cannot be empty'
+
+  default_repo_path="backups/$restic_host/restic"
+  prompt_value 'Remote repository path without a leading slash' "$default_repo_path"
+  repo_path=${REPLY#/}
+  [[ -n "$repo_path" && "$repo_path" != *$'\n'* ]] || fail 'repository path cannot be empty'
+  repository="rclone:$remote:$repo_path"
+
+  required_paths=()
+  prompt_value 'First required backup path' /etc
+  required_path=$REPLY
+  [[ "$required_path" == /* && ( -e "$required_path" || -L "$required_path" ) ]] || fail "required path is missing: $required_path"
+  required_paths+=("$required_path")
+  prompt_value 'Second required backup path' /root
+  required_path=$REPLY
+  [[ "$required_path" == /* && ( -e "$required_path" || -L "$required_path" ) ]] || fail "required path is missing: $required_path"
+  required_paths+=("$required_path")
+  unset required_path
+  while :; do
+    ask_backup_path 'Additional required path (blank to finish)' false required_path
+    [[ -n "${required_path:-}" ]] || break
+    [[ -e "$required_path" || -L "$required_path" ]] || { printf 'Required path does not exist: %s\n' "$required_path" >&3; unset required_path; continue; }
+    required_paths+=("$required_path")
+    unset required_path
+  done
+
+  optional_paths=()
+  while :; do
+    ask_backup_path 'Optional path (blank to finish)' false optional_path
+    [[ -n "${optional_path:-}" ]] || break
+    optional_paths+=("$optional_path")
+    unset optional_path
+  done
+
+  exclude_file=
+  if confirm_default_yes 'Enable the default exclude rules for temporary and virtual filesystem paths'; then
+    exclude_file=/etc/restic/excludes.txt
+  fi
+
+  prompt_value 'Snapshot tag' vps
+  restic_tag=$REPLY
+  ask_nonnegative_integer 'Keep daily snapshots' 7 keep_daily
+  ask_nonnegative_integer 'Keep weekly snapshots' 5 keep_weekly
+  ask_nonnegative_integer 'Keep monthly snapshots' 12 keep_monthly
+  ask_nonnegative_integer 'Keep yearly snapshots' 3 keep_yearly
+  (( keep_daily + keep_weekly + keep_monthly + keep_yearly > 0 )) || fail 'at least one retention value must be greater than zero'
+  if confirm_default_yes 'Apply retention after every successful backup'; then
+    forget_after_backup=true
+  else
+    forget_after_backup=false
+  fi
+
+  install -d -o root -g root -m 0700 /etc/restic
+  if [[ -e "$PASSWORD_FILE" || -L "$PASSWORD_FILE" ]]; then
+    [[ -f "$PASSWORD_FILE" && ! -L "$PASSWORD_FILE" ]] || fail "restic password must be a regular file, not a symlink: $PASSWORD_FILE"
+    if confirm 'Reuse the existing restic password file'; then
+      validate_private_file 'restic password file' "$PASSWORD_FILE"
+    else
+      confirm 'Replace the existing restic password file (old backups become unreadable)' || fail 'installation cancelled'
+      openssl rand -base64 48 >"$PASSWORD_FILE"
+      chown root:root "$PASSWORD_FILE"
+      chmod 0600 "$PASSWORD_FILE"
+    fi
+  else
+    printf 'Generating a new restic password at %s.\n' "$PASSWORD_FILE" >&3
+    openssl rand -base64 48 >"$PASSWORD_FILE"
+    chown root:root "$PASSWORD_FILE"
+    chmod 0600 "$PASSWORD_FILE"
+  fi
+  validate_private_file 'restic password file' "$PASSWORD_FILE"
+  [[ -s "$PASSWORD_FILE" ]] || fail 'restic password file is empty'
+  confirm 'Have you saved the restic password securely outside this VPS' || fail 'save the password outside this VPS before continuing'
+
+  if [[ -n "$exclude_file" ]]; then
+    install -d -o root -g root -m 0700 /etc/restic
+    if [[ ! -e "$exclude_file" ]]; then
+      install -o root -g root -m 0600 "$TMP_DIR/excludes.example" "$exclude_file"
+    fi
+    [[ -f "$exclude_file" && ! -L "$exclude_file" ]] || fail "exclude file must be a regular file, not a symlink: $exclude_file"
+    chmod 0600 "$exclude_file"
+    chown root:root "$exclude_file"
+    printf 'Review %s before relying on its exclusions.\n' "$exclude_file" >&3
+  fi
+
+  write_config "$TMP_DIR/generated.conf"
+else
+  validate_private_file 'backup configuration' "$CONFIG_FILE"
+fi
+
+[[ -d /usr/local/sbin ]] || install -d -o root -g root -m 0755 /usr/local/sbin
+install -o root -g root -m 0750 "$TMP_DIR/backup.sh" "$BIN"
+[[ -d "$UNIT_DIR" ]] || install -d -o root -g root -m 0755 "$UNIT_DIR"
+for name in restic-rclone-backup.service restic-rclone-backup.timer restic-rclone-prune.service restic-rclone-prune.timer; do
+  install -o root -g root -m 0644 "$TMP_DIR/$name" "$UNIT_DIR/$name"
+done
+if [[ "$reuse_config" == false ]]; then
+  install -o root -g root -m 0600 "$TMP_DIR/generated.conf" "$CONFIG_FILE"
+fi
+
+export RESTIC_RCLONE_CONFIG=$CONFIG_FILE
+printf '\nInstalled backup command at %s.\n' "$BIN" >&3
+if [[ "$reuse_config" == true ]]; then
+  printf 'Kept the existing configuration at %s.\n' "$CONFIG_FILE" >&3
+  # Configuration is root-owned, mode 0600, and treated as executable Bash.
+  source "$CONFIG_FILE"
+  repository=$RESTIC_REPOSITORY
+else
+  printf 'Wrote the new configuration to %s.\n' "$CONFIG_FILE" >&3
+fi
+printf 'Configured repository: %s\n' "$repository" >&3
+
+repository_ready=false
+if "$BIN" snapshots; then
+  repository_ready=true
+else
+  printf '\nThe repository could not be opened. Check the remote, credentials, password, and exact path above.\n' >&3
+  confirm "Initialize a repository at $repository" || fail 'repository was not initialized; timers were not enabled'
+  "$BIN" init
+  repository_ready=true
+fi
+
+[[ "$repository_ready" == true ]] || fail 'repository is not ready'
+if confirm_default_yes 'Run the first backup now'; then
+  "$BIN" backup
+else
+  fail 'first backup is required before enabling timers'
+fi
+
+systemctl daemon-reload
+if confirm_default_yes 'Enable and start the daily backup and weekly prune timers'; then
+  systemctl enable --now restic-rclone-backup.timer restic-rclone-prune.timer
+  printf '\nInstallation complete. Timer status:\n' >&3
+  systemctl list-timers --no-pager restic-rclone-backup.timer restic-rclone-prune.timer >&3
+else
+  printf '\nInstallation complete, but timers are not enabled.\n' >&3
+fi
+
+printf '\nUseful commands:\n' >&3
+printf '  %s snapshots\n' "$BIN" >&3
+printf '  %s check\n' "$BIN" >&3
+printf '  journalctl -u restic-rclone-backup.service --since today\n' >&3
+printf '  %s restore latest /restore\n' "$BIN" >&3

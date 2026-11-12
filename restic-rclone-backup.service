@@ -1,0 +1,19 @@
+[Unit]
+Description=Back up VPS data to a restic repository via rclone
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+User=root
+UMask=0077
+Environment=RESTIC_RCLONE_CONFIG=/etc/restic-rclone-backup.conf
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/local/sbin/restic-rclone-backup backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ProtectSystem=full
+ProtectHome=read-only
+NoNewPrivileges=true

@@ -1,0 +1,17 @@
+# 可选 restic 排除规则示例。
+# 复制为 /etc/restic/excludes.txt，并设置 RESTIC_EXCLUDE_FILE 启用。
+
+/tmp
+/var/tmp
+/var/cache
+/proc
+/sys
+/dev
+/run
+/mnt
+/media
+/lost+found
+
+# 如有需要可取消注释用户缓存目录：
+# /home/*/.cache
+# /root/.cache

@@ -1,0 +1,43 @@
+# 复制到 /etc/restic-rclone-backup.conf 后按本机环境修改。
+# 文件会作为 Bash 配置加载，请确保 root 拥有且权限为 0600。
+# restic 会自动排除该配置、密码文件和 rclone 配置，不把本机凭据备份进仓库。
+
+# rclone remote 名称，以及专用于这台 VPS 的远端目录。
+RESTIC_REPOSITORY='rclone:myremote:backups/my-vps/restic'
+RESTIC_PASSWORD_FILE='/etc/restic/restic-password'
+RCLONE_CONFIG='/root/.config/rclone/rclone.conf'
+
+# 固定主机名，让快照和保留策略稳定归类。
+RESTIC_HOST='my-vps'
+RESTIC_CACHE_DIR='/var/cache/restic-rclone-backup'
+RESTIC_LOCK_FILE='/run/lock/restic-rclone-backup.lock'
+
+# 必需路径：每个路径都必须存在，否则脚本会中止，避免漏备份。
+BACKUP_PATHS=(
+  /etc
+  /root
+)
+
+# 可选路径：不存在时跳过并写日志。按 VPS 上实际部署添加或删除。
+BACKUP_OPTIONAL_PATHS=(
+  /home
+  /var/www
+  /opt
+  /srv
+)
+
+# 可选排除文件；不启用时留空。
+# 启用前请审阅排除规则，匹配的数据将无法从快照恢复。
+RESTIC_EXCLUDE_FILE=''
+# RESTIC_EXCLUDE_FILE='/etc/restic/excludes.txt'
+
+# 可选标签。
+RESTIC_TAGS=(vps)
+
+# 保留策略：每天 7 份、每周 5 份、每月 12 份、每年 3 份。
+# 每次备份成功后应用 forget 保留策略；prune 建议另行每周执行。
+RESTIC_KEEP_DAILY=7
+RESTIC_KEEP_WEEKLY=5
+RESTIC_KEEP_MONTHLY=12
+RESTIC_KEEP_YEARLY=3
+RESTIC_FORGET_AFTER_BACKUP=true
